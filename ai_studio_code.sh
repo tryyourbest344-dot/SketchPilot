@@ -685,31 +685,80 @@ object PathVectorizer {
         edgeMap: BooleanArray,
         width: Int,
         height: Int,
-        minPathPoints: Int = 4,
-        rdpEpsilon: Float = 1.6f
+        minPathPoints: Int = 3,
+        rdpEpsilon: Float = 1.0f
     ): List<List<PointF>> {
         val visited = BooleanArray(width * height)
         val rawPaths = ArrayList<List<PointF>>()
 
+        // Pass 1: Trace from true endpoints (degree == 1) so open curves stay continuous
         for (y in 1 until height - 1) {
+            val row = y * width
             for (x in 1 until width - 1) {
-                val startIdx = y * width + x
+                val startIdx = row + x
+                if (!edgeMap[startIdx] || visited[startIdx]) continue
+                if (neighborCount(edgeMap, width, x, y) != 1) continue
+
+                val traced = traceBidirectional(edgeMap, visited, width, height, x, y)
+                acceptTracedPath(traced, minPathPoints, rdpEpsilon, rawPaths)
+            }
+        }
+
+        // Pass 2: Trace remaining closed loops and junctions bidirectionally
+        for (y in 1 until height - 1) {
+            val row = y * width
+            for (x in 1 until width - 1) {
+                val startIdx = row + x
                 if (!edgeMap[startIdx] || visited[startIdx]) continue
 
-                val traced = tracePolyline(edgeMap, visited, width, height, x, y)
-                if (traced.size >= minPathPoints) {
-                    val simplified = ramerDouglasPeucker(traced, rdpEpsilon)
-                    if (simplified.size >= 2) {
-                        rawPaths.add(simplified)
-                    }
-                }
+                val traced = traceBidirectional(edgeMap, visited, width, height, x, y)
+                acceptTracedPath(traced, minPathPoints, rdpEpsilon, rawPaths)
             }
         }
 
         return orderNearestNeighbor(rawPaths)
     }
 
-    private fun tracePolyline(
+    private fun acceptTracedPath(
+        traced: List<PointF>,
+        minPathPoints: Int,
+        rdpEpsilon: Float,
+        out: MutableList<List<PointF>>
+    ) {
+        if (traced.size < minPathPoints) return
+
+        val isClosedLoop = traced.size >= 6 &&
+            hypot(traced.first().x - traced.last().x, traced.first().y - traced.last().y) <= 2.2f
+
+        val simplified = ramerDouglasPeucker(traced, rdpEpsilon)
+        if (simplified.size < 2) return
+
+        val result = if (isClosedLoop && simplified.size >= 3 &&
+            hypot(simplified.first().x - simplified.last().x, simplified.first().y - simplified.last().y) > 0.5f
+        ) {
+            ArrayList<PointF>(simplified.size + 1).apply {
+                addAll(simplified)
+                add(PointF(simplified.first().x, simplified.first().y))
+            }
+        } else {
+            simplified
+        }
+
+        if (strokeArcLength(result) >= 2.5f) {
+            out.add(result)
+        }
+    }
+
+    private fun neighborCount(edgeMap: BooleanArray, width: Int, x: Int, y: Int): Int {
+        var count = 0
+        for (dir in 0 until 8) {
+            val nIdx = (y + dy[dir]) * width + (x + dx[dir])
+            if (edgeMap[nIdx]) count++
+        }
+        return count
+    }
+
+    private fun traceBidirectional(
         edgeMap: BooleanArray,
         visited: BooleanArray,
         width: Int,
@@ -717,10 +766,50 @@ object PathVectorizer {
         startX: Int,
         startY: Int
     ): List<PointF> {
+        val forward = traceHalf(edgeMap, visited, width, height, startX, startY, initialPrevDir = -1)
+
+        // Check if start pixel still has an unvisited branch in the opposite direction
+        var backDir = -1
+        for (dir in 0 until 8) {
+            val nx = startX + dx[dir]
+            val ny = startY + dy[dir]
+            if (nx <= 0 || nx >= width - 1 || ny <= 0 || ny >= height - 1) continue
+            val nIdx = ny * width + nx
+            if (edgeMap[nIdx] && !visited[nIdx]) {
+                backDir = dir
+                break
+            }
+        }
+
+        if (backDir == -1) {
+            return forward
+        }
+
+        val bx = startX + dx[backDir]
+        val by = startY + dy[backDir]
+        val backward = traceHalf(edgeMap, visited, width, height, bx, by, initialPrevDir = backDir)
+
+        val combined = ArrayList<PointF>(backward.size + forward.size)
+        for (i in backward.indices.reversed()) {
+            combined.add(backward[i])
+        }
+        combined.addAll(forward)
+        return combined
+    }
+
+    private fun traceHalf(
+        edgeMap: BooleanArray,
+        visited: BooleanArray,
+        width: Int,
+        height: Int,
+        startX: Int,
+        startY: Int,
+        initialPrevDir: Int
+    ): List<PointF> {
         val points = ArrayList<PointF>(64)
         var cx = startX
         var cy = startY
-        var prevDir = -1
+        var prevDir = initialPrevDir
 
         while (true) {
             val cIdx = cy * width + cx
@@ -742,10 +831,13 @@ object PathVectorizer {
                     0
                 } else {
                     val diff = abs(dir - prevDir)
-                    minOf(diff, 8 - diff)
+                    minOf(diff, 8 - diff) * 2
                 }
-                if (turnCost < bestScore) {
-                    bestScore = turnCost
+                // Slight preference for 4-connected steps at equal turn cost for smoother raster walking
+                val orthoBias = dir and 1
+                val score = turnCost + orthoBias
+                if (score < bestScore) {
+                    bestScore = score
                     bestDir = dir
                 }
             }
@@ -793,6 +885,14 @@ object PathVectorizer {
         val len = hypot(dxAB, dyAB)
         if (len < 1e-5f) return hypot(p.x - a.x, p.y - a.y)
         return abs(dyAB * p.x - dxAB * p.y + b.x * a.y - b.y * a.x) / len
+    }
+
+    private fun strokeArcLength(points: List<PointF>): Float {
+        var total = 0f
+        for (i in 0 until points.size - 1) {
+            total += hypot(points[i + 1].x - points[i].x, points[i + 1].y - points[i].y)
+        }
+        return total
     }
 
     private fun orderNearestNeighbor(paths: List<List<PointF>>): List<List<PointF>> {
@@ -860,6 +960,7 @@ import com.sketchpilot.app.model.SketchData
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlin.math.atan2
+import kotlin.math.floor
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -874,28 +975,52 @@ object SketchProcessor {
         uri: Uri,
         detailLevel: Int = 55
     ): SketchData = withContext(Dispatchers.Default) {
-        val rawBitmap = decodeScaledWithExif(context, uri, maxDim = 1800)
+        val clampedDetail = detailLevel.coerceIn(1, 100)
+
+        val rawBitmap = decodeScaledWithExif(context, uri)
             ?: throw IllegalArgumentException("Unable to decode selected image.")
 
-        val normalized900 = resizeProportionallyTo900(rawBitmap)
+        val normalized900 = centerCropTo900(rawBitmap)
         if (rawBitmap !== normalized900) {
             rawBitmap.recycle()
         }
 
         val gray = toGrayscale(normalized900)
-        val blurred = gaussianBlur5x5(gray, TARGET_SIZE, TARGET_SIZE)
-        val edges = extractCannyThinEdges(blurred, TARGET_SIZE, TARGET_SIZE, detailLevel)
+        normalized900.recycle()
+
+        val enhanced = applyClahe(gray, TARGET_SIZE, TARGET_SIZE, gridSize = 8, clipLimitFactor = 2.4f)
+        val blended = FloatArray(gray.size) { i ->
+            0.60f * enhanced[i] + 0.40f * gray[i]
+        }
+
+        val smoothed = if (clampedDetail < 25) {
+            gaussianBlur5x5(blended, TARGET_SIZE, TARGET_SIZE)
+        } else {
+            gaussianBlur3x3(blended, TARGET_SIZE, TARGET_SIZE)
+        }
+
+        val edges = extractCannyThinEdges(smoothed, TARGET_SIZE, TARGET_SIZE, clampedDetail)
+
+        if (clampedDetail >= 25) {
+            mergeThinDarkLineRidges(smoothed, edges, TARGET_SIZE, TARGET_SIZE, clampedDetail)
+        }
+
+        zhangSuenThin(edges, TARGET_SIZE, TARGET_SIZE, maxIterations = 2)
+        removeIsolatedDots(edges, TARGET_SIZE, TARGET_SIZE)
+
+        val detailNorm = clampedDetail / 100f
+        val rdpEpsilon = 1.25f - detailNorm * 0.45f
+        val minPathPoints = if (clampedDetail >= 35) 3 else 4
 
         val strokes = PathVectorizer.vectorizeAndOrder(
             edgeMap = edges,
             width = TARGET_SIZE,
             height = TARGET_SIZE,
-            minPathPoints = 4,
-            rdpEpsilon = 1.6f
+            minPathPoints = minPathPoints,
+            rdpEpsilon = rdpEpsilon
         )
 
         val previewBitmap = renderStrokesToBitmap(strokes, TARGET_SIZE)
-        normalized900.recycle()
 
         SketchData(
             canvasSize = TARGET_SIZE,
@@ -905,7 +1030,7 @@ object SketchProcessor {
         )
     }
 
-    private fun decodeScaledWithExif(context: Context, uri: Uri, maxDim: Int): Bitmap? {
+    private fun decodeScaledWithExif(context: Context, uri: Uri): Bitmap? {
         val resolver = context.contentResolver
 
         val boundsOpts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -914,8 +1039,17 @@ object SketchProcessor {
         }
         if (boundsOpts.outWidth <= 0 || boundsOpts.outHeight <= 0) return null
 
+        val origMin = min(boundsOpts.outWidth, boundsOpts.outHeight)
+        val origMax = max(boundsOpts.outWidth, boundsOpts.outHeight)
+
+        // Keep the shorter dimension >= 900px whenever possible so center-cropping stays sharp
         var sampleSize = 1
-        while (boundsOpts.outWidth / sampleSize > maxDim || boundsOpts.outHeight / sampleSize > maxDim) {
+        while (origMin / (sampleSize * 2) >= TARGET_SIZE &&
+            origMax / (sampleSize * 2) >= TARGET_SIZE
+        ) {
+            sampleSize *= 2
+        }
+        while (origMax / sampleSize > 4096 && origMin / (sampleSize * 2) >= 450) {
             sampleSize *= 2
         }
 
@@ -941,6 +1075,14 @@ object SketchProcessor {
             ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
             ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.preScale(-1f, 1f)
             ExifInterface.ORIENTATION_FLIP_VERTICAL -> matrix.preScale(1f, -1f)
+            ExifInterface.ORIENTATION_TRANSPOSE -> {
+                matrix.postRotate(90f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_TRANSVERSE -> {
+                matrix.postRotate(270f)
+                matrix.postScale(-1f, 1f)
+            }
             else -> return decoded
         }
 
@@ -949,27 +1091,29 @@ object SketchProcessor {
         return rotated
     }
 
-    private fun resizeProportionallyTo900(source: Bitmap): Bitmap {
-        val output = Bitmap.createBitmap(TARGET_SIZE, TARGET_SIZE, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(output)
-        canvas.drawColor(Color.WHITE)
+    private fun centerCropTo900(source: Bitmap): Bitmap {
+        val srcW = source.width
+        val srcH = source.height
+        val cropSide = min(srcW, srcH)
+        val left = (srcW - cropSide) / 2
+        val top = (srcH - cropSide) / 2
 
-        val scale = min(
-            TARGET_SIZE.toFloat() / source.width,
-            TARGET_SIZE.toFloat() / source.height
-        )
-        val scaledW = (source.width * scale).roundToInt().coerceAtLeast(1)
-        val scaledH = (source.height * scale).roundToInt().coerceAtLeast(1)
-
-        val scaledBitmap = Bitmap.createScaledBitmap(source, scaledW, scaledH, true)
-        val left = (TARGET_SIZE - scaledW) / 2f
-        val top = (TARGET_SIZE - scaledH) / 2f
-
-        canvas.drawBitmap(scaledBitmap, left, top, Paint(Paint.FILTER_BITMAP_FLAG))
-        if (scaledBitmap !== source) {
-            scaledBitmap.recycle()
+        val square = if (srcW == cropSide && srcH == cropSide) {
+            source
+        } else {
+            Bitmap.createBitmap(source, left, top, cropSide, cropSide)
         }
-        return output
+
+        val scaled = if (square.width == TARGET_SIZE && square.height == TARGET_SIZE) {
+            square
+        } else {
+            Bitmap.createScaledBitmap(square, TARGET_SIZE, TARGET_SIZE, true)
+        }
+
+        if (square !== source && square !== scaled) {
+            square.recycle()
+        }
+        return scaled
     }
 
     private fun toGrayscale(bitmap: Bitmap): FloatArray {
@@ -980,12 +1124,124 @@ object SketchProcessor {
         val gray = FloatArray(w * h)
         for (i in pixels.indices) {
             val c = pixels[i]
+            val a = ((c ushr 24) and 0xFF) / 255f
             val r = (c shr 16) and 0xFF
             val g = (c shr 8) and 0xFF
             val b = c and 0xFF
-            gray[i] = 0.299f * r + 0.587f * g + 0.114f * b
+            val lum = 0.299f * r + 0.587f * g + 0.114f * b
+            gray[i] = lum * a + 255f * (1f - a)
         }
         return gray
+    }
+
+    private fun applyClahe(
+        gray: FloatArray,
+        w: Int,
+        h: Int,
+        gridSize: Int,
+        clipLimitFactor: Float
+    ): FloatArray {
+        val luts = Array(gridSize) { Array(gridSize) { FloatArray(256) } }
+        val hist = IntArray(256)
+
+        for (ty in 0 until gridSize) {
+            val y0 = (ty * h) / gridSize
+            val y1 = ((ty + 1) * h) / gridSize
+            for (tx in 0 until gridSize) {
+                val x0 = (tx * w) / gridSize
+                val x1 = ((tx + 1) * w) / gridSize
+                hist.fill(0)
+
+                for (y in y0 until y1) {
+                    val row = y * w
+                    for (x in x0 until x1) {
+                        val bin = gray[row + x].roundToInt().coerceIn(0, 255)
+                        hist[bin]++
+                    }
+                }
+
+                val tilePixels = (x1 - x0) * (y1 - y0)
+                if (tilePixels <= 0) continue
+
+                val clipLimit = max(1, ((clipLimitFactor * tilePixels) / 256f).roundToInt())
+                var excess = 0
+                for (i in 0 until 256) {
+                    if (hist[i] > clipLimit) {
+                        excess += hist[i] - clipLimit
+                        hist[i] = clipLimit
+                    }
+                }
+
+                val avgInc = excess / 256
+                val rem = excess % 256
+                for (i in 0 until 256) {
+                    hist[i] += avgInc + if (i < rem) 1 else 0
+                }
+
+                var cdf = 0
+                val lut = luts[ty][tx]
+                val scale = 255f / tilePixels.toFloat()
+                for (i in 0 until 256) {
+                    cdf += hist[i]
+                    lut[i] = (cdf * scale).coerceIn(0f, 255f)
+                }
+            }
+        }
+
+        val out = FloatArray(w * h)
+        val tileW = w.toFloat() / gridSize
+        val tileH = h.toFloat() / gridSize
+
+        for (y in 0 until h) {
+            val fy = (y + 0.5f) / tileH - 0.5f
+            val ty0 = floor(fy).toInt().coerceIn(0, gridSize - 1)
+            val ty1 = (ty0 + 1).coerceIn(0, gridSize - 1)
+            val ay = (fy - ty0).coerceIn(0f, 1f)
+            val row = y * w
+
+            for (x in 0 until w) {
+                val fx = (x + 0.5f) / tileW - 0.5f
+                val tx0 = floor(fx).toInt().coerceIn(0, gridSize - 1)
+                val tx1 = (tx0 + 1).coerceIn(0, gridSize - 1)
+                val ax = (fx - tx0).coerceIn(0f, 1f)
+
+                val bin = gray[row + x].roundToInt().coerceIn(0, 255)
+                val v00 = luts[ty0][tx0][bin]
+                val v10 = luts[ty0][tx1][bin]
+                val v01 = luts[ty1][tx0][bin]
+                val v11 = luts[ty1][tx1][bin]
+
+                val top = v00 + (v10 - v00) * ax
+                val bot = v01 + (v11 - v01) * ax
+                out[row + x] = top + (bot - top) * ay
+            }
+        }
+
+        return out
+    }
+
+    private fun gaussianBlur3x3(src: FloatArray, w: Int, h: Int): FloatArray {
+        val temp = FloatArray(w * h)
+        val dst = FloatArray(w * h)
+
+        for (y in 0 until h) {
+            val row = y * w
+            for (x in 0 until w) {
+                val xm = max(0, x - 1)
+                val xp = min(w - 1, x + 1)
+                temp[row + x] = (src[row + xm] + 2f * src[row + x] + src[row + xp]) * 0.25f
+            }
+        }
+
+        for (y in 0 until h) {
+            val ym = max(0, y - 1) * w
+            val yc = y * w
+            val yp = min(h - 1, y + 1) * w
+            for (x in 0 until w) {
+                dst[yc + x] = (temp[ym + x] + 2f * temp[yc + x] + temp[yp + x]) * 0.25f
+            }
+        }
+        return dst
     }
 
     private fun gaussianBlur5x5(src: FloatArray, w: Int, h: Int): FloatArray {
@@ -1037,6 +1293,7 @@ object SketchProcessor {
     ): BooleanArray {
         val mag = FloatArray(w * h)
         val dir = ByteArray(w * h)
+        val borderMargin = 3
 
         for (y in 1 until h - 1) {
             val ym = (y - 1) * w
@@ -1067,15 +1324,15 @@ object SketchProcessor {
 
         val nms = FloatArray(w * h)
         var maxMag = 0f
-        var magSum = 0.0
-        var nonZeroCount = 0
+        var sigCount = 0
+        val noiseFloor = 5f
 
-        for (y in 1 until h - 1) {
+        for (y in borderMargin until h - borderMargin) {
             val row = y * w
-            for (x in 1 until w - 1) {
+            for (x in borderMargin until w - borderMargin) {
                 val idx = row + x
                 val m = mag[idx]
-                if (m <= 1f) continue
+                if (m < noiseFloor) continue
 
                 val (n1, n2) = when (dir[idx].toInt()) {
                     0 -> mag[idx - 1] to mag[idx + 1]
@@ -1087,29 +1344,58 @@ object SketchProcessor {
                 if (m >= n1 && m >= n2) {
                     nms[idx] = m
                     if (m > maxMag) maxMag = m
-                    magSum += m
-                    nonZeroCount++
+                    sigCount++
                 }
             }
         }
 
-        if (nonZeroCount == 0 || maxMag <= 1f) {
+        if (sigCount == 0 || maxMag <= noiseFloor) {
             return BooleanArray(w * h)
         }
 
-        val meanNms = (magSum / nonZeroCount).toFloat()
-        val detailFactor = 1.65f - (detailLevel.coerceIn(1, 100) / 100f) * 1.15f
-        val highThresh = max(18f, min(maxMag * 0.65f, meanNms * 1.8f * detailFactor))
-        val lowThresh = highThresh * 0.42f
+        val bins = 512
+        val hist = IntArray(bins)
+        val binScale = (bins - 1) / maxMag
+        for (i in nms.indices) {
+            val v = nms[i]
+            if (v >= noiseFloor) {
+                val b = (v * binScale).toInt().coerceIn(0, bins - 1)
+                hist[b]++
+            }
+        }
+
+        val detailNorm = detailLevel.coerceIn(1, 100) / 100f
+        val keepFraction = 0.08f + detailNorm * 0.64f
+        val targetCount = max(1, (sigCount * keepFraction).roundToInt())
+
+        var acc = 0
+        var quantileBin = bins - 1
+        for (b in bins - 1 downTo 0) {
+            acc += hist[b]
+            if (acc >= targetCount) {
+                quantileBin = b
+                break
+            }
+        }
+
+        val quantileHigh = quantileBin / binScale
+        val minHigh = 10f + (1f - detailNorm) * 20f
+        val maxHigh = maxMag * (0.62f - detailNorm * 0.27f)
+        val highThresh = quantileHigh.coerceIn(minHigh, max(minHigh, maxHigh))
+        val lowThresh = max(noiseFloor, highThresh * 0.36f)
 
         val edges = BooleanArray(w * h)
         val stack = IntArray(w * h)
         var stackTop = 0
 
-        for (i in nms.indices) {
-            if (nms[i] >= highThresh) {
-                edges[i] = true
-                stack[stackTop++] = i
+        for (y in borderMargin until h - borderMargin) {
+            val row = y * w
+            for (x in borderMargin until w - borderMargin) {
+                val idx = row + x
+                if (nms[idx] >= highThresh) {
+                    edges[idx] = true
+                    stack[stackTop++] = idx
+                }
             }
         }
 
@@ -1117,7 +1403,9 @@ object SketchProcessor {
             val idx = stack[--stackTop]
             val x = idx % w
             val y = idx / w
-            if (x <= 1 || x >= w - 2 || y <= 1 || y >= h - 2) continue
+            if (x <= borderMargin || x >= w - borderMargin - 1 ||
+                y <= borderMargin || y >= h - borderMargin - 1
+            ) continue
 
             for (dy in -1..1) {
                 val ny = (y + dy) * w
@@ -1132,8 +1420,54 @@ object SketchProcessor {
             }
         }
 
-        zhangSuenThin(edges, w, h, maxIterations = 6)
         return edges
+    }
+
+    /**
+     * Extracts 1-pixel centerlines of thin dark strokes (pupils, eyelashes, fine ink lines)
+     * by requiring BOTH opposing sides to be brighter, avoiding double-edges on step boundaries.
+     */
+    private fun mergeThinDarkLineRidges(
+        gray: FloatArray,
+        edges: BooleanArray,
+        w: Int,
+        h: Int,
+        detailLevel: Int
+    ) {
+        val margin = 4
+        val detailNorm = detailLevel.coerceIn(1, 100) / 100f
+        val valleyThresh = 26f - detailNorm * 14f
+
+        for (y in margin until h - margin) {
+            val row = y * w
+            for (x in margin until w - margin) {
+                val idx = row + x
+                if (edges[idx]) continue
+                val c = gray[idx]
+
+                val hValley = min(gray[idx - 2], gray[idx + 2]) - c
+                val hMin = c <= gray[idx - 1] && c <= gray[idx + 1]
+
+                val vValley = min(gray[idx - 2 * w], gray[idx + 2 * w]) - c
+                val vMin = c <= gray[idx - w] && c <= gray[idx + w]
+
+                val d1Valley = min(gray[idx - 2 * w - 2], gray[idx + 2 * w + 2]) - c
+                val d1Min = c <= gray[idx - w - 1] && c <= gray[idx + w + 1]
+
+                val d2Valley = min(gray[idx - 2 * w + 2], gray[idx + 2 * w - 2]) - c
+                val d2Min = c <= gray[idx - w + 1] && c <= gray[idx + w - 1]
+
+                val isThinDarkLine =
+                    (hMin && hValley >= valleyThresh) ||
+                    (vMin && vValley >= valleyThresh) ||
+                    (d1Min && d1Valley >= valleyThresh) ||
+                    (d2Min && d2Valley >= valleyThresh)
+
+                if (isThinDarkLine) {
+                    edges[idx] = true
+                }
+            }
+        }
     }
 
     private fun zhangSuenThin(img: BooleanArray, w: Int, h: Int, maxIterations: Int) {
@@ -1188,6 +1522,23 @@ object SketchProcessor {
         }
     }
 
+    private fun removeIsolatedDots(edges: BooleanArray, w: Int, h: Int) {
+        for (y in 1 until h - 1) {
+            val row = y * w
+            for (x in 1 until w - 1) {
+                val idx = row + x
+                if (!edges[idx]) continue
+                val hasNeighbor =
+                    edges[idx - w - 1] || edges[idx - w] || edges[idx - w + 1] ||
+                    edges[idx - 1] || edges[idx + 1] ||
+                    edges[idx + w - 1] || edges[idx + w] || edges[idx + w + 1]
+                if (!hasNeighbor) {
+                    edges[idx] = false
+                }
+            }
+        }
+    }
+
     private fun renderStrokesToBitmap(strokes: List<List<PointF>>, size: Int): Bitmap {
         val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
@@ -1196,7 +1547,7 @@ object SketchProcessor {
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.BLACK
             style = Paint.Style.STROKE
-            strokeWidth = 2.2f
+            strokeWidth = 2.0f
             strokeCap = Paint.Cap.ROUND
             strokeJoin = Paint.Join.ROUND
         }
