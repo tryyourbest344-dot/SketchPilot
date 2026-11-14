@@ -257,7 +257,7 @@ cat <<'EOF' > "$ROOT/app/src/main/res/layout/activity_main.xml"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginBottom="12dp"
-            android:text="Offline Line-Art Sketch &amp; Gesture Drawer"
+            android:text="Offline Sketch &amp; Gesture Drawer"
             android:textSize="14sp" />
 
         <Button
@@ -546,8 +546,8 @@ import android.graphics.Bitmap
 import android.graphics.PointF
 
 data class SketchData(
-    val width: Int,
-    val height: Int,
+    val canvasWidth: Int,
+    val canvasHeight: Int,
     val previewBitmap: Bitmap,
     val strokes: List<List<PointF>>,
     val totalPoints: Int
@@ -600,4 +600,4 @@ object SketchSessionManager {
     val targetCanvasRect: StateFlow<RectF?> = _targetCanvasRect.asStateFlow()
 
     private val _drawingStatus = MutableStateFlow(DrawingStatus.IDLE)
-    val drawingStatus: StateFlow<Drawi
+    val drawingStatus: StateFlow<Dr
