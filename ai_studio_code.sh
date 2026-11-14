@@ -191,7 +191,7 @@ cat <<'EOF' > "$ROOT/app/src/main/res/values/strings.xml"
 <resources>
     <string name="app_name">SketchPilot</string>
     <string name="accessibility_service_label">SketchPilot Gesture Drawer</string>
-    <string name="accessibility_service_description">Replays your converted 900x900 black-and-white sketch paths as touch gestures onto a calibrated screen region.</string>
+    <string name="accessibility_service_description">Replays your converted black-and-white sketch paths as touch gestures onto a calibrated screen region.</string>
 </resources>
 EOF
 
@@ -257,7 +257,7 @@ cat <<'EOF' > "$ROOT/app/src/main/res/layout/activity_main.xml"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginBottom="12dp"
-            android:text="Offline 900×900 Sketch &amp; Gesture Drawer"
+            android:text="Offline Line-Art Sketch &amp; Gesture Drawer"
             android:textSize="14sp" />
 
         <Button
@@ -276,7 +276,7 @@ cat <<'EOF' > "$ROOT/app/src/main/res/layout/activity_main.xml"
                 android:id="@+id/ivSketchPreview"
                 android:layout_width="match_parent"
                 android:layout_height="match_parent"
-                android:contentDescription="900x900 Sketch Preview"
+                android:contentDescription="Sketch Preview"
                 android:scaleType="fitCenter" />
 
             <ProgressBar
@@ -546,7 +546,8 @@ import android.graphics.Bitmap
 import android.graphics.PointF
 
 data class SketchData(
-    val canvasSize: Int = 900,
+    val width: Int,
+    val height: Int,
     val previewBitmap: Bitmap,
     val strokes: List<List<PointF>>,
     val totalPoints: Int
@@ -685,11 +686,13 @@ object PathVectorizer {
         edgeMap: BooleanArray,
         width: Int,
         height: Int,
-        minPathPoints: Int = 3,
-        rdpEpsilon: Float = 1.0f
+        minPathPoints: Int = 4,
+        minArcLength: Float = 14f,
+        rdpEpsilon: Float = 1.15f,
+        maxStrokes: Int = 700
     ): List<List<PointF>> {
         val visited = BooleanArray(width * height)
-        val rawPaths = ArrayList<List<PointF>>()
+        val rawPaths = ArrayList<Pair<List<PointF>, Float>>()
 
         // Pass 1: Trace from true endpoints (degree == 1) so open curves stay continuous
         for (y in 1 until height - 1) {
@@ -700,7 +703,7 @@ object PathVectorizer {
                 if (neighborCount(edgeMap, width, x, y) != 1) continue
 
                 val traced = traceBidirectional(edgeMap, visited, width, height, x, y)
-                acceptTracedPath(traced, minPathPoints, rdpEpsilon, rawPaths)
+                acceptTracedPath(traced, minPathPoints, minArcLength, rdpEpsilon, rawPaths)
             }
         }
 
@@ -712,25 +715,36 @@ object PathVectorizer {
                 if (!edgeMap[startIdx] || visited[startIdx]) continue
 
                 val traced = traceBidirectional(edgeMap, visited, width, height, x, y)
-                acceptTracedPath(traced, minPathPoints, rdpEpsilon, rawPaths)
+                acceptTracedPath(traced, minPathPoints, minArcLength, rdpEpsilon, rawPaths)
             }
         }
 
-        return orderNearestNeighbor(rawPaths)
+        val selected = if (rawPaths.size > maxStrokes) {
+            rawPaths
+                .sortedByDescending { it.second }
+                .take(maxStrokes)
+                .map { it.first }
+        } else {
+            rawPaths.map { it.first }
+        }
+
+        return orderNearestNeighbor(selected)
     }
 
     private fun acceptTracedPath(
         traced: List<PointF>,
         minPathPoints: Int,
+        minArcLength: Float,
         rdpEpsilon: Float,
-        out: MutableList<List<PointF>>
+        out: MutableList<Pair<List<PointF>, Float>>
     ) {
         if (traced.size < minPathPoints) return
 
         val isClosedLoop = traced.size >= 6 &&
-            hypot(traced.first().x - traced.last().x, traced.first().y - traced.last().y) <= 2.2f
+            hypot(traced.first().x - traced.last().x, traced.first().y - traced.last().y) <= 2.5f
 
-        val simplified = ramerDouglasPeucker(traced, rdpEpsilon)
+        val smoothed = smoothPath(traced, isClosedLoop, passes = 2)
+        val simplified = ramerDouglasPeucker(smoothed, rdpEpsilon)
         if (simplified.size < 2) return
 
         val result = if (isClosedLoop && simplified.size >= 3 &&
@@ -744,9 +758,55 @@ object PathVectorizer {
             simplified
         }
 
-        if (strokeArcLength(result) >= 2.5f) {
-            out.add(result)
+        val arcLen = strokeArcLength(result)
+        if (arcLen >= minArcLength) {
+            out.add(result to arcLen)
         }
+    }
+
+    private fun smoothPath(
+        points: List<PointF>,
+        isClosedLoop: Boolean,
+        passes: Int
+    ): List<PointF> {
+        if (points.size < 3 || passes <= 0) return points
+
+        var current = points
+        val n = points.size
+
+        repeat(passes) {
+            val next = ArrayList<PointF>(n)
+            if (isClosedLoop) {
+                for (i in 0 until n) {
+                    val prev = current[(i - 1 + n) % n]
+                    val curr = current[i]
+                    val nxt = current[(i + 1) % n]
+                    next.add(
+                        PointF(
+                            0.25f * prev.x + 0.5f * curr.x + 0.25f * nxt.x,
+                            0.25f * prev.y + 0.5f * curr.y + 0.25f * nxt.y
+                        )
+                    )
+                }
+            } else {
+                next.add(PointF(current[0].x, current[0].y))
+                for (i in 1 until n - 1) {
+                    val prev = current[i - 1]
+                    val curr = current[i]
+                    val nxt = current[i + 1]
+                    next.add(
+                        PointF(
+                            0.25f * prev.x + 0.5f * curr.x + 0.25f * nxt.x,
+                            0.25f * prev.y + 0.5f * curr.y + 0.25f * nxt.y
+                        )
+                    )
+                }
+                next.add(PointF(current[n - 1].x, current[n - 1].y))
+            }
+            current = next
+        }
+
+        return current
     }
 
     private fun neighborCount(edgeMap: BooleanArray, width: Int, x: Int, y: Int): Int {
@@ -768,7 +828,6 @@ object PathVectorizer {
     ): List<PointF> {
         val forward = traceHalf(edgeMap, visited, width, height, startX, startY, initialPrevDir = -1)
 
-        // Check if start pixel still has an unvisited branch in the opposite direction
         var backDir = -1
         for (dir in 0 until 8) {
             val nx = startX + dx[dir]
@@ -833,7 +892,6 @@ object PathVectorizer {
                     val diff = abs(dir - prevDir)
                     minOf(diff, 8 - diff) * 2
                 }
-                // Slight preference for 4-connected steps at equal turn cost for smoother raster walking
                 val orthoBias = dir and 1
                 val score = turnCost + orthoBias
                 if (score < bestScore) {
@@ -959,8 +1017,9 @@ import androidx.exifinterface.media.ExifInterface
 import com.sketchpilot.app.model.SketchData
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
 import kotlin.math.atan2
-import kotlin.math.floor
+import kotlin.math.exp
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
@@ -968,7 +1027,8 @@ import kotlin.math.roundToInt
 
 object SketchProcessor {
 
-    const val TARGET_SIZE = 900
+    private const val MAX_WORK_DIMENSION = 800
+    private const val MIN_WORK_DIMENSION = 420
 
     suspend fun processImageUri(
         context: Context,
@@ -976,54 +1036,78 @@ object SketchProcessor {
         detailLevel: Int = 55
     ): SketchData = withContext(Dispatchers.Default) {
         val clampedDetail = detailLevel.coerceIn(1, 100)
+        val detailNorm = (clampedDetail - 1) / 99f
 
         val rawBitmap = decodeScaledWithExif(context, uri)
             ?: throw IllegalArgumentException("Unable to decode selected image.")
 
-        val normalized900 = centerCropTo900(rawBitmap)
-        if (rawBitmap !== normalized900) {
+        val workBitmap = scalePreservingAspectRatio(rawBitmap)
+        if (rawBitmap !== workBitmap) {
             rawBitmap.recycle()
         }
 
-        val gray = toGrayscale(normalized900)
-        normalized900.recycle()
+        val workW = workBitmap.width
+        val workH = workBitmap.height
+        val gray = toGrayscale(workBitmap)
+        workBitmap.recycle()
 
-        val enhanced = applyClahe(gray, TARGET_SIZE, TARGET_SIZE, gridSize = 8, clipLimitFactor = 2.4f)
-        val blended = FloatArray(gray.size) { i ->
-            0.60f * enhanced[i] + 0.40f * gray[i]
+        val borderMargin = min(10, max(5, (min(workW, workH) * 0.015f).roundToInt()))
+
+        // Edge-preserving bilateral smoothing suppresses textures, skin pores, and background noise
+        // while keeping primary outlines and key features sharp.
+        val bilateralPasses = if (clampedDetail < 65) 2 else 1
+        val sigmaR = 32f - detailNorm * 18f
+        var smoothed = gray
+        repeat(bilateralPasses) {
+            smoothed = bilateralFilter5x5(smoothed, workW, workH, sigmaS = 2.0f, sigmaR = sigmaR)
         }
+        smoothed = gaussianBlur3x3(smoothed, workW, workH)
 
-        val smoothed = if (clampedDetail < 25) {
-            gaussianBlur5x5(blended, TARGET_SIZE, TARGET_SIZE)
-        } else {
-            gaussianBlur3x3(blended, TARGET_SIZE, TARGET_SIZE)
-        }
+        // Gentle global contrast stretch based on interior percentiles (avoids local noise amplification)
+        val normalized = normalizeGlobalContrast(smoothed, workW, workH, borderMargin)
 
-        val edges = extractCannyThinEdges(smoothed, TARGET_SIZE, TARGET_SIZE, clampedDetail)
+        val edges = extractCannyThinEdges(normalized, workW, workH, clampedDetail, borderMargin)
 
         if (clampedDetail >= 25) {
-            mergeThinDarkLineRidges(smoothed, edges, TARGET_SIZE, TARGET_SIZE, clampedDetail)
+            mergeThinDarkLineRidges(normalized, edges, workW, workH, clampedDetail, borderMargin)
         }
 
-        zhangSuenThin(edges, TARGET_SIZE, TARGET_SIZE, maxIterations = 2)
-        removeIsolatedDots(edges, TARGET_SIZE, TARGET_SIZE)
+        zhangSuenThin(edges, workW, workH, maxIterations = 10)
+        removeIsolatedDots(edges, workW, workH)
 
-        val detailNorm = clampedDetail / 100f
-        val rdpEpsilon = 1.25f - detailNorm * 0.45f
-        val minPathPoints = if (clampedDetail >= 35) 3 else 4
+        val minComponentPixels = (13f - detailNorm * 6f).roundToInt().coerceAtLeast(5)
+        val borderStripX = max(10, (workW * 0.025f).roundToInt())
+        val borderStripY = max(10, (workH * 0.025f).roundToInt())
+        pruneSmallAndBorderComponents(
+            edges = edges,
+            w = workW,
+            h = workH,
+            minPixels = minComponentPixels,
+            borderStripX = borderStripX,
+            borderStripY = borderStripY
+        )
+
+        val scaleFactor = max(workW, workH) / 800f
+        val rdpEpsilon = (1.45f - detailNorm * 0.55f) * max(0.8f, scaleFactor)
+        val minArcLength = (20f - detailNorm * 9f) * max(0.75f, scaleFactor)
+        val minPathPoints = if (clampedDetail >= 45) 3 else 4
+        val maxStrokes = (260 + detailNorm * 640f).roundToInt()
 
         val strokes = PathVectorizer.vectorizeAndOrder(
             edgeMap = edges,
-            width = TARGET_SIZE,
-            height = TARGET_SIZE,
+            width = workW,
+            height = workH,
             minPathPoints = minPathPoints,
-            rdpEpsilon = rdpEpsilon
+            minArcLength = minArcLength,
+            rdpEpsilon = rdpEpsilon,
+            maxStrokes = maxStrokes
         )
 
-        val previewBitmap = renderStrokesToBitmap(strokes, TARGET_SIZE)
+        val previewBitmap = renderStrokesToBitmap(strokes, workW, workH)
 
         SketchData(
-            canvasSize = TARGET_SIZE,
+            width = workW,
+            height = workH,
             previewBitmap = previewBitmap,
             strokes = strokes,
             totalPoints = strokes.sumOf { it.size }
@@ -1039,17 +1123,12 @@ object SketchProcessor {
         }
         if (boundsOpts.outWidth <= 0 || boundsOpts.outHeight <= 0) return null
 
-        val origMin = min(boundsOpts.outWidth, boundsOpts.outHeight)
         val origMax = max(boundsOpts.outWidth, boundsOpts.outHeight)
-
-        // Keep the shorter dimension >= 900px whenever possible so center-cropping stays sharp
         var sampleSize = 1
-        while (origMin / (sampleSize * 2) >= TARGET_SIZE &&
-            origMax / (sampleSize * 2) >= TARGET_SIZE
-        ) {
+        while (origMax / (sampleSize * 2) >= MAX_WORK_DIMENSION) {
             sampleSize *= 2
         }
-        while (origMax / sampleSize > 4096 && origMin / (sampleSize * 2) >= 450) {
+        while (origMax / sampleSize > 4096) {
             sampleSize *= 2
         }
 
@@ -1091,29 +1170,24 @@ object SketchProcessor {
         return rotated
     }
 
-    private fun centerCropTo900(source: Bitmap): Bitmap {
+    private fun scalePreservingAspectRatio(source: Bitmap): Bitmap {
         val srcW = source.width
         val srcH = source.height
-        val cropSide = min(srcW, srcH)
-        val left = (srcW - cropSide) / 2
-        val top = (srcH - cropSide) / 2
+        val srcMax = max(srcW, srcH)
 
-        val square = if (srcW == cropSide && srcH == cropSide) {
-            source
-        } else {
-            Bitmap.createBitmap(source, left, top, cropSide, cropSide)
+        val scale = when {
+            srcMax > MAX_WORK_DIMENSION -> MAX_WORK_DIMENSION.toFloat() / srcMax
+            srcMax < MIN_WORK_DIMENSION -> MIN_WORK_DIMENSION.toFloat() / srcMax
+            else -> 1f
         }
 
-        val scaled = if (square.width == TARGET_SIZE && square.height == TARGET_SIZE) {
-            square
-        } else {
-            Bitmap.createScaledBitmap(square, TARGET_SIZE, TARGET_SIZE, true)
-        }
+        val dstW = max(48, (srcW * scale).roundToInt())
+        val dstH = max(48, (srcH * scale).roundToInt())
 
-        if (square !== source && square !== scaled) {
-            square.recycle()
+        if (dstW == srcW && dstH == srcH) {
+            return source
         }
-        return scaled
+        return Bitmap.createScaledBitmap(source, dstW, dstH, true)
     }
 
     private fun toGrayscale(bitmap: Bitmap): FloatArray {
@@ -1134,90 +1208,52 @@ object SketchProcessor {
         return gray
     }
 
-    private fun applyClahe(
-        gray: FloatArray,
+    private fun bilateralFilter5x5(
+        src: FloatArray,
         w: Int,
         h: Int,
-        gridSize: Int,
-        clipLimitFactor: Float
+        sigmaS: Float,
+        sigmaR: Float
     ): FloatArray {
-        val luts = Array(gridSize) { Array(gridSize) { FloatArray(256) } }
-        val hist = IntArray(256)
-
-        for (ty in 0 until gridSize) {
-            val y0 = (ty * h) / gridSize
-            val y1 = ((ty + 1) * h) / gridSize
-            for (tx in 0 until gridSize) {
-                val x0 = (tx * w) / gridSize
-                val x1 = ((tx + 1) * w) / gridSize
-                hist.fill(0)
-
-                for (y in y0 until y1) {
-                    val row = y * w
-                    for (x in x0 until x1) {
-                        val bin = gray[row + x].roundToInt().coerceIn(0, 255)
-                        hist[bin]++
-                    }
-                }
-
-                val tilePixels = (x1 - x0) * (y1 - y0)
-                if (tilePixels <= 0) continue
-
-                val clipLimit = max(1, ((clipLimitFactor * tilePixels) / 256f).roundToInt())
-                var excess = 0
-                for (i in 0 until 256) {
-                    if (hist[i] > clipLimit) {
-                        excess += hist[i] - clipLimit
-                        hist[i] = clipLimit
-                    }
-                }
-
-                val avgInc = excess / 256
-                val rem = excess % 256
-                for (i in 0 until 256) {
-                    hist[i] += avgInc + if (i < rem) 1 else 0
-                }
-
-                var cdf = 0
-                val lut = luts[ty][tx]
-                val scale = 255f / tilePixels.toFloat()
-                for (i in 0 until 256) {
-                    cdf += hist[i]
-                    lut[i] = (cdf * scale).coerceIn(0f, 255f)
-                }
+        val spatial = FloatArray(25)
+        var sIdx = 0
+        val twoSigmaSSq = 2f * sigmaS * sigmaS
+        for (dy in -2..2) {
+            for (dx in -2..2) {
+                spatial[sIdx++] = exp(-(dx * dx + dy * dy) / twoSigmaSSq)
             }
         }
 
-        val out = FloatArray(w * h)
-        val tileW = w.toFloat() / gridSize
-        val tileH = h.toFloat() / gridSize
+        val rangeLut = FloatArray(256)
+        val twoSigmaRSq = 2f * sigmaR * sigmaR
+        for (d in 0 until 256) {
+            rangeLut[d] = exp(-(d * d) / twoSigmaRSq)
+        }
 
+        val dst = FloatArray(w * h)
         for (y in 0 until h) {
-            val fy = (y + 0.5f) / tileH - 0.5f
-            val ty0 = floor(fy).toInt().coerceIn(0, gridSize - 1)
-            val ty1 = (ty0 + 1).coerceIn(0, gridSize - 1)
-            val ay = (fy - ty0).coerceIn(0f, 1f)
             val row = y * w
-
             for (x in 0 until w) {
-                val fx = (x + 0.5f) / tileW - 0.5f
-                val tx0 = floor(fx).toInt().coerceIn(0, gridSize - 1)
-                val tx1 = (tx0 + 1).coerceIn(0, gridSize - 1)
-                val ax = (fx - tx0).coerceIn(0f, 1f)
-
-                val bin = gray[row + x].roundToInt().coerceIn(0, 255)
-                val v00 = luts[ty0][tx0][bin]
-                val v10 = luts[ty0][tx1][bin]
-                val v01 = luts[ty1][tx0][bin]
-                val v11 = luts[ty1][tx1][bin]
-
-                val top = v00 + (v10 - v00) * ax
-                val bot = v01 + (v11 - v01) * ax
-                out[row + x] = top + (bot - top) * ay
+                val center = src[row + x]
+                var weightSum = 0f
+                var valueSum = 0f
+                var k = 0
+                for (dy in -2..2) {
+                    val ny = (y + dy).coerceIn(0, h - 1)
+                    val nRow = ny * w
+                    for (dx in -2..2) {
+                        val nx = (x + dx).coerceIn(0, w - 1)
+                        val v = src[nRow + nx]
+                        val diff = abs(v - center).roundToInt().coerceIn(0, 255)
+                        val weight = spatial[k++] * rangeLut[diff]
+                        weightSum += weight
+                        valueSum += weight * v
+                    }
+                }
+                dst[row + x] = if (weightSum > 0f) valueSum / weightSum else center
             }
         }
-
-        return out
+        return dst
     }
 
     private fun gaussianBlur3x3(src: FloatArray, w: Int, h: Int): FloatArray {
@@ -1244,56 +1280,67 @@ object SketchProcessor {
         return dst
     }
 
-    private fun gaussianBlur5x5(src: FloatArray, w: Int, h: Int): FloatArray {
-        val temp = FloatArray(w * h)
-        val dst = FloatArray(w * h)
+    private fun normalizeGlobalContrast(
+        gray: FloatArray,
+        w: Int,
+        h: Int,
+        borderMargin: Int
+    ): FloatArray {
+        val hist = IntArray(256)
+        var total = 0
+        for (y in borderMargin until h - borderMargin) {
+            val row = y * w
+            for (x in borderMargin until w - borderMargin) {
+                val bin = gray[row + x].roundToInt().coerceIn(0, 255)
+                hist[bin]++
+                total++
+            }
+        }
+        if (total <= 0) return gray
 
-        for (y in 0 until h) {
-            val rowOffset = y * w
-            for (x in 0 until w) {
-                val x0 = max(0, x - 2)
-                val x1 = max(0, x - 1)
-                val x2 = x
-                val x3 = min(w - 1, x + 1)
-                val x4 = min(w - 1, x + 2)
-                temp[rowOffset + x] = (
-                    src[rowOffset + x0] +
-                    4f * src[rowOffset + x1] +
-                    6f * src[rowOffset + x2] +
-                    4f * src[rowOffset + x3] +
-                    src[rowOffset + x4]
-                ) / 16f
+        val lowTarget = (total * 0.02f).roundToInt()
+        val highTarget = (total * 0.98f).roundToInt()
+
+        var acc = 0
+        var pLow = 0
+        for (i in 0 until 256) {
+            acc += hist[i]
+            if (acc >= lowTarget) {
+                pLow = i
+                break
             }
         }
 
-        for (y in 0 until h) {
-            val y0 = max(0, y - 2) * w
-            val y1 = max(0, y - 1) * w
-            val y2 = y * w
-            val y3 = min(h - 1, y + 1) * w
-            val y4 = min(h - 1, y + 2) * w
-            for (x in 0 until w) {
-                dst[y2 + x] = (
-                    temp[y0 + x] +
-                    4f * temp[y1 + x] +
-                    6f * temp[y2 + x] +
-                    4f * temp[y3 + x] +
-                    temp[y4 + x]
-                ) / 16f
+        acc = 0
+        var pHigh = 255
+        for (i in 0 until 256) {
+            acc += hist[i]
+            if (acc >= highTarget) {
+                pHigh = i
+                break
             }
         }
-        return dst
+
+        val span = (pHigh - pLow).toFloat()
+        if (span < 18f) return gray
+
+        val gain = min(2.2f, 255f / span)
+        val out = FloatArray(gray.size)
+        for (i in gray.indices) {
+            out[i] = ((gray[i] - pLow) * gain).coerceIn(0f, 255f)
+        }
+        return out
     }
 
     private fun extractCannyThinEdges(
         gray: FloatArray,
         w: Int,
         h: Int,
-        detailLevel: Int
+        detailLevel: Int,
+        borderMargin: Int
     ): BooleanArray {
         val mag = FloatArray(w * h)
         val dir = ByteArray(w * h)
-        val borderMargin = 3
 
         for (y in 1 until h - 1) {
             val ym = (y - 1) * w
@@ -1322,10 +1369,12 @@ object SketchProcessor {
             }
         }
 
+        val detailNorm = (detailLevel.coerceIn(1, 100) - 1) / 99f
+        val noiseFloor = 15f - detailNorm * 7f
+
         val nms = FloatArray(w * h)
         var maxMag = 0f
         var sigCount = 0
-        val noiseFloor = 5f
 
         for (y in borderMargin until h - borderMargin) {
             val row = y * w
@@ -1364,8 +1413,8 @@ object SketchProcessor {
             }
         }
 
-        val detailNorm = detailLevel.coerceIn(1, 100) / 100f
-        val keepFraction = 0.08f + detailNorm * 0.64f
+        // Keep only the strongest contour ridges so output resembles clean line-art, not texture clutter.
+        val keepFraction = 0.05f + detailNorm * 0.15f + detailNorm * detailNorm * 0.12f
         val targetCount = max(1, (sigCount * keepFraction).roundToInt())
 
         var acc = 0
@@ -1379,10 +1428,10 @@ object SketchProcessor {
         }
 
         val quantileHigh = quantileBin / binScale
-        val minHigh = 10f + (1f - detailNorm) * 20f
-        val maxHigh = maxMag * (0.62f - detailNorm * 0.27f)
+        val minHigh = 46f - detailNorm * 28f
+        val maxHigh = maxMag * (0.68f - detailNorm * 0.25f)
         val highThresh = quantileHigh.coerceIn(minHigh, max(minHigh, maxHigh))
-        val lowThresh = max(noiseFloor, highThresh * 0.36f)
+        val lowThresh = max(noiseFloor, highThresh * 0.44f)
 
         val edges = BooleanArray(w * h)
         val stack = IntArray(w * h)
@@ -1424,19 +1473,20 @@ object SketchProcessor {
     }
 
     /**
-     * Extracts 1-pixel centerlines of thin dark strokes (pupils, eyelashes, fine ink lines)
-     * by requiring BOTH opposing sides to be brighter, avoiding double-edges on step boundaries.
+     * Captures high-contrast thin dark strokes (pupils, eyelashes, clean ink lines)
+     * while ignoring low-contrast shading/texture noise.
      */
     private fun mergeThinDarkLineRidges(
         gray: FloatArray,
         edges: BooleanArray,
         w: Int,
         h: Int,
-        detailLevel: Int
+        detailLevel: Int,
+        borderMargin: Int
     ) {
-        val margin = 4
-        val detailNorm = detailLevel.coerceIn(1, 100) / 100f
-        val valleyThresh = 26f - detailNorm * 14f
+        val margin = borderMargin + 2
+        val detailNorm = (detailLevel.coerceIn(1, 100) - 1) / 99f
+        val valleyThresh = 44f - detailNorm * 20f
 
         for (y in margin until h - margin) {
             val row = y * w
@@ -1539,15 +1589,100 @@ object SketchProcessor {
         }
     }
 
-    private fun renderStrokesToBitmap(strokes: List<List<PointF>>, size: Int): Bitmap {
-        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+    private fun pruneSmallAndBorderComponents(
+        edges: BooleanArray,
+        w: Int,
+        h: Int,
+        minPixels: Int,
+        borderStripX: Int,
+        borderStripY: Int
+    ) {
+        val visited = BooleanArray(w * h)
+        val queue = IntArray(w * h)
+        val comp = ArrayList<Int>(256)
+
+        for (y in 1 until h - 1) {
+            val row = y * w
+            for (x in 1 until w - 1) {
+                val startIdx = row + x
+                if (!edges[startIdx] || visited[startIdx]) continue
+
+                comp.clear()
+                var head = 0
+                var tail = 0
+                queue[tail++] = startIdx
+                visited[startIdx] = true
+
+                var minX = x
+                var maxX = x
+                var minY = y
+                var maxY = y
+
+                while (head < tail) {
+                    val curr = queue[head++]
+                    comp.add(curr)
+                    val cx = curr % w
+                    val cy = curr / w
+                    if (cx < minX) minX = cx
+                    if (cx > maxX) maxX = cx
+                    if (cy < minY) minY = cy
+                    if (cy > maxY) maxY = cy
+
+                    for (dy in -1..1) {
+                        val ny = cy + dy
+                        if (ny <= 0 || ny >= h - 1) continue
+                        val nRow = ny * w
+                        for (dx in -1..1) {
+                            if (dx == 0 && dy == 0) continue
+                            val nx = cx + dx
+                            if (nx <= 0 || nx >= w - 1) continue
+                            val nIdx = nRow + nx
+                            if (edges[nIdx] && !visited[nIdx]) {
+                                visited[nIdx] = true
+                                queue[tail++] = nIdx
+                            }
+                        }
+                    }
+                }
+
+                val boxW = maxX - minX
+                val boxH = maxY - minY
+                val diag = hypot(boxW.toFloat(), boxH.toFloat())
+
+                val isTinyNoise = comp.size < minPixels && diag < minPixels * 1.4f
+                val isLeftBorderLine = maxX <= borderStripX && boxW <= 6 && boxH > 12
+                val isRightBorderLine = minX >= w - 1 - borderStripX && boxW <= 6 && boxH > 12
+                val isTopBorderLine = maxY <= borderStripY && boxH <= 6 && boxW > 12
+                val isBottomBorderLine = minY >= h - 1 - borderStripY && boxH <= 6 && boxW > 12
+
+                if (isTinyNoise ||
+                    isLeftBorderLine ||
+                    isRightBorderLine ||
+                    isTopBorderLine ||
+                    isBottomBorderLine
+                ) {
+                    for (idx in comp) {
+                        edges[idx] = false
+                    }
+                }
+            }
+        }
+    }
+
+    private fun renderStrokesToBitmap(
+        strokes: List<List<PointF>>,
+        width: Int,
+        height: Int
+    ): Bitmap {
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
         canvas.drawColor(Color.WHITE)
 
+        val strokeW = max(1.6f, max(width, height) / 420f)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.BLACK
             style = Paint.Style.STROKE
-            strokeWidth = 2.0f
+            strokeWidth = strokeW
             strokeCap = Paint.Cap.ROUND
             strokeJoin = Paint.Join.ROUND
         }
@@ -1700,7 +1835,8 @@ class SketchAccessibilityService : AccessibilityService() {
         drawingJob = serviceScope.launch {
             val scaledStrokes = scaleStrokesToRect(
                 strokes = sketch.strokes,
-                sourceSize = sketch.canvasSize.toFloat(),
+                sourceWidth = sketch.width.toFloat(),
+                sourceHeight = sketch.height.toFloat(),
                 targetRect = targetRect
             )
 
@@ -1826,16 +1962,21 @@ class SketchAccessibilityService : AccessibilityService() {
 
     private fun scaleStrokesToRect(
         strokes: List<List<PointF>>,
-        sourceSize: Float,
+        sourceWidth: Float,
+        sourceHeight: Float,
         targetRect: RectF
     ): List<List<PointF>> {
+        if (sourceWidth <= 0f || sourceHeight <= 0f) return emptyList()
+
         val metrics = resources.displayMetrics
         val maxX = (metrics.widthPixels - 2).toFloat()
         val maxY = (metrics.heightPixels - 2).toFloat()
 
-        val scale = min(targetRect.width() / sourceSize, targetRect.height() / sourceSize)
-        val offsetX = targetRect.left + (targetRect.width() - sourceSize * scale) / 2f
-        val offsetY = targetRect.top + (targetRect.height() - sourceSize * scale) / 2f
+        val scale = min(targetRect.width() / sourceWidth, targetRect.height() / sourceHeight)
+        val drawnWidth = sourceWidth * scale
+        val drawnHeight = sourceHeight * scale
+        val offsetX = targetRect.left + (targetRect.width() - drawnWidth) / 2f
+        val offsetY = targetRect.top + (targetRect.height() - drawnHeight) / 2f
 
         return strokes.map { stroke ->
             stroke.map { pt ->
@@ -2227,7 +2368,7 @@ class CanvasCalibrationView @JvmOverloads constructor(
 
     private val boxRect = RectF(140f, 380f, 840f, 1080f)
     private val handleRadius = 46f
-    private val minBoxSize = 180f
+    private val minBoxSize = 120f
 
     private var dragMode = DragMode.NONE
     private var lastX = 0f
@@ -2263,368 +2404,4 @@ class CanvasCalibrationView @JvmOverloads constructor(
             val loc = IntArray(2)
             getLocationOnScreen(loc)
             boxRect.set(
-                savedScreenRect.left - loc[0],
-                savedScreenRect.top - loc[1],
-                savedScreenRect.right - loc[0],
-                savedScreenRect.bottom - loc[1]
-            )
-        } else if (width > 0 && height > 0) {
-            val side = min(width, height) * 0.72f
-            val left = (width - side) / 2f
-            val top = (height - side) / 2f
-            boxRect.set(left, top, left + side, top + side)
-        }
-        invalidate()
-    }
-
-    fun getScreenTargetRect(): RectF {
-        val loc = IntArray(2)
-        getLocationOnScreen(loc)
-        return RectF(
-            boxRect.left + loc[0],
-            boxRect.top + loc[1],
-            boxRect.right + loc[0],
-            boxRect.bottom + loc[1]
-        )
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        val w = width.toFloat()
-        val h = height.toFloat()
-
-        canvas.drawRect(0f, 0f, w, boxRect.top, scrimPaint)
-        canvas.drawRect(0f, boxRect.bottom, w, h, scrimPaint)
-        canvas.drawRect(0f, boxRect.top, boxRect.left, boxRect.bottom, scrimPaint)
-        canvas.drawRect(boxRect.right, boxRect.top, w, boxRect.bottom, scrimPaint)
-
-        canvas.drawRect(boxRect, borderPaint)
-        canvas.drawCircle(boxRect.right, boxRect.bottom, handleRadius * 0.55f, handlePaint)
-
-        canvas.drawText(
-            "Drag box over drawing canvas • Drag corner to resize",
-            boxRect.centerX(),
-            max(60f, boxRect.top - 28f),
-            textPaint
-        )
-    }
-
-    override fun onTouchEvent(event: MotionEvent): Boolean {
-        val x = event.x
-        val y = event.y
-
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                val nearCorner = (x - boxRect.right) * (x - boxRect.right) +
-                    (y - boxRect.bottom) * (y - boxRect.bottom) <= handleRadius * handleRadius * 2.2f
-
-                dragMode = when {
-                    nearCorner -> DragMode.RESIZE
-                    boxRect.contains(x, y) -> DragMode.MOVE
-                    else -> DragMode.NONE
-                }
-                lastX = x
-                lastY = y
-                return dragMode != DragMode.NONE
-            }
-
-            MotionEvent.ACTION_MOVE -> {
-                val dx = x - lastX
-                val dy = y - lastY
-                lastX = x
-                lastY = y
-
-                when (dragMode) {
-                    DragMode.MOVE -> {
-                        val clampedDx = dx.coerceIn(-boxRect.left, width - boxRect.right)
-                        val clampedDy = dy.coerceIn(-boxRect.top, height - boxRect.bottom)
-                        boxRect.offset(clampedDx, clampedDy)
-                    }
-                    DragMode.RESIZE -> {
-                        boxRect.right = (boxRect.right + dx).coerceIn(boxRect.left + minBoxSize, width.toFloat())
-                        boxRect.bottom = (boxRect.bottom + dy).coerceIn(boxRect.top + minBoxSize, height.toFloat())
-                    }
-                    DragMode.NONE -> return false
-                }
-                invalidate()
-                return true
-            }
-
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                dragMode = DragMode.NONE
-                return true
-            }
-        }
-        return super.onTouchEvent(event)
-    }
-}
-EOF
-
-cat <<'EOF' > "$ROOT/app/src/main/java/com/sketchpilot/app/ui/MainActivity.kt"
-package com.sketchpilot.app.ui
-
-import android.Manifest
-import android.content.ComponentName
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.net.Uri
-import android.os.Build
-import android.os.Bundle
-import android.provider.Settings
-import android.text.TextUtils
-import android.view.View
-import android.widget.SeekBar
-import android.widget.Toast
-import androidx.activity.result.PickVisualMediaRequest
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AlertDialog
-import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.ContextCompat
-import androidx.lifecycle.lifecycleScope
-import com.sketchpilot.app.databinding.ActivityMainBinding
-import com.sketchpilot.app.processing.SketchProcessor
-import com.sketchpilot.app.service.FloatingOverlayService
-import com.sketchpilot.app.service.SketchAccessibilityService
-import com.sketchpilot.app.state.SketchSessionManager
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.launch
-import kotlin.math.roundToInt
-
-class MainActivity : AppCompatActivity() {
-
-    private lateinit var binding: ActivityMainBinding
-    private var selectedImageUri: Uri? = null
-    private var conversionJob: Job? = null
-
-    private val pickMediaLauncher = registerForActivityResult(
-        ActivityResultContracts.PickVisualMedia()
-    ) { uri ->
-        if (uri != null) {
-            selectedImageUri = uri
-            runSketchConversion(uri)
-        }
-    }
-
-    private val notificationPermLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) {
-            startOverlayIfPermitted()
-        } else {
-            Toast.makeText(
-                this,
-                "Notification permission is needed to keep the floating bubble alive.",
-                Toast.LENGTH_LONG
-            ).show()
-        }
-    }
-
-    private val overlayPermLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) {
-        updatePermissionUi()
-    }
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        binding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(binding.root)
-
-        setupUi()
-        observeSession()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        updatePermissionUi()
-    }
-
-    private fun setupUi() {
-        binding.btnPickImage.setOnClickListener {
-            pickMediaLauncher.launch(
-                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-            )
-        }
-
-        binding.seekDetail.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
-                binding.tvDetailValue.text = "Sketch Detail: ${progress.coerceAtLeast(1)}%"
-            }
-
-            override fun onStartTrackingTouch(sb: SeekBar?) {}
-
-            override fun onStopTrackingTouch(sb: SeekBar?) {
-                selectedImageUri?.let { runSketchConversion(it) }
-            }
-        })
-
-        binding.seekSpeed.max = 2350
-        binding.seekSpeed.progress = (SketchSessionManager.speedPxPerSec.value - 150f).roundToInt()
-        binding.tvSpeedValue.text =
-            "Drawing Speed: ${SketchSessionManager.speedPxPerSec.value.roundToInt()} px/s"
-
-        binding.seekSpeed.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
-                val speed = 150f + progress
-                binding.tvSpeedValue.text = "Drawing Speed: ${speed.roundToInt()} px/s"
-                if (fromUser) SketchSessionManager.setSpeedPxPerSec(speed)
-            }
-            override fun onStartTrackingTouch(sb: SeekBar?) {}
-            override fun onStopTrackingTouch(sb: SeekBar?) {}
-        })
-
-        binding.btnGrantOverlay.setOnClickListener {
-            val intent = Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:$packageName")
-            )
-            overlayPermLauncher.launch(intent)
-        }
-
-        binding.btnEnableAccessibility.setOnClickListener {
-            showAccessibilityGuideDialog()
-        }
-
-        binding.btnLaunchBubble.setOnClickListener {
-            if (!Settings.canDrawOverlays(this)) {
-                Toast.makeText(this, "Grant 'Display over other apps' first.", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            if (!isAccessibilityServiceEnabled()) {
-                Toast.makeText(this, "Enable SketchPilot Accessibility Service first.", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
-                PackageManager.PERMISSION_GRANTED
-            ) {
-                notificationPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-            } else {
-                startOverlayIfPermitted()
-            }
-        }
-    }
-
-    private fun startOverlayIfPermitted() {
-        val intent = Intent(this, FloatingOverlayService::class.java)
-        ContextCompat.startForegroundService(this, intent)
-        Toast.makeText(
-            this,
-            "Floating bubble started! Switch to WePlay or any drawing app.",
-            Toast.LENGTH_LONG
-        ).show()
-    }
-
-    private fun runSketchConversion(uri: Uri) {
-        conversionJob?.cancel()
-        val detail = binding.seekDetail.progress.coerceIn(1, 100)
-
-        conversionJob = lifecycleScope.launch {
-            binding.progressConverting.visibility = View.VISIBLE
-            binding.tvSketchInfo.text = "Converting to 900×900 sketch & tracing paths..."
-
-            try {
-                val sketch = SketchProcessor.processImageUri(this@MainActivity, uri, detail)
-                SketchSessionManager.setSketchData(sketch)
-                binding.ivSketchPreview.setImageBitmap(sketch.previewBitmap)
-                binding.tvSketchInfo.text =
-                    "900×900 Sketch Ready • ${sketch.strokes.size} strokes • ${sketch.totalPoints} points"
-            } catch (e: Exception) {
-                Toast.makeText(
-                    this@MainActivity,
-                    "Failed to convert image: ${e.message}",
-                    Toast.LENGTH_LONG
-                ).show()
-                binding.tvSketchInfo.text = "Conversion failed."
-            } finally {
-                binding.progressConverting.visibility = View.GONE
-            }
-        }
-    }
-
-    private fun observeSession() {
-        lifecycleScope.launch {
-            SketchSessionManager.progress.collect { prog ->
-                binding.tvMainProgress.text =
-                    "Drawing Progress: ${prog.percentage}% (${prog.completedStrokes}/${prog.totalStrokes}) — ${prog.statusMessage}"
-                binding.mainProgressBar.progress = prog.percentage
-            }
-        }
-        lifecycleScope.launch {
-            SketchSessionManager.isOverlayRunning.collect { running ->
-                binding.btnLaunchBubble.text =
-                    if (running) "Floating Bubble Active" else "Start Floating Bubble"
-            }
-        }
-    }
-
-    private fun updatePermissionUi() {
-        val overlayGranted = Settings.canDrawOverlays(this)
-        val accessibilityGranted = isAccessibilityServiceEnabled()
-
-        binding.tvOverlayStatus.text = if (overlayGranted) {
-            "Overlay Permission: Granted"
-        } else {
-            "Overlay Permission: Required"
-        }
-        binding.btnGrantOverlay.isEnabled = !overlayGranted
-
-        binding.tvAccessibilityStatus.text = if (accessibilityGranted) {
-            "Accessibility Service: Enabled"
-        } else {
-            "Accessibility Service: Disabled"
-        }
-    }
-
-    private fun isAccessibilityServiceEnabled(): Boolean {
-        val expectedComponent = ComponentName(this, SketchAccessibilityService::class.java)
-        val enabledServices = Settings.Secure.getString(
-            contentResolver,
-            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-        ) ?: return false
-
-        val splitter = TextUtils.SimpleStringSplitter(':')
-        splitter.setString(enabledServices)
-        while (splitter.hasNext()) {
-            val component = ComponentName.unflattenFromString(splitter.next())
-            if (component == expectedComponent) return true
-        }
-        return false
-    }
-
-    private fun showAccessibilityGuideDialog() {
-        AlertDialog.Builder(this)
-            .setTitle("Enable Accessibility Service")
-            .setMessage(
-                "1. Tap 'Open Settings' below.\n" +
-                "2. Open 'Installed apps' or 'Downloaded apps'.\n" +
-                "3. Select 'SketchPilot' and turn it ON.\n\n" +
-                "Note for Android 13–16 sideloaded APKs: If the toggle is greyed out, go to " +
-                "Settings → Apps → SketchPilot → ⋮ (top right) → Allow restricted settings, then return here."
-            )
-            .setPositiveButton("Open Settings") { _, _ ->
-                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-}
-EOF
-
-if command -v zip >/dev/null 2>&1; then
-    zip -r SketchPilot.zip "$ROOT"
-elif command -v python3 >/dev/null 2>&1; then
-    python3 -c '
-import os, zipfile
-with zipfile.ZipFile("SketchPilot.zip", "w", zipfile.ZIP_DEFLATED) as zf:
-    for root, _, files in os.walk("SketchPilot"):
-        for f in files:
-            p = os.path.join(root, f)
-            zf.write(p)
-'
-else
-    echo "Created ./$ROOT directory. Compress it into SketchPilot.zip using your file manager."
-    exit 0
-fi
-
-echo "Done! Created SketchPilot.zip containing all 26 project files."
+            
