@@ -519,7 +519,7 @@ cat <<'EOF' > "$ROOT/app/src/main/res/layout/overlay_calibration.xml"
     <LinearLayout
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="bottom|center_x"
+        android:layout_gravity="bottom|center_horizontal"
         android:layout_marginBottom="40dp"
         android:orientation="horizontal">
 
